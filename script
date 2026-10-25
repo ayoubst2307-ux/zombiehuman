@@ -1,0 +1,671 @@
+repeat task.wait() until game:IsLoaded()
+
+local Cloneref     = cloneref or function(i) return i end
+local Players      = Cloneref(game:GetService("Players"))
+local RunService   = Cloneref(game:GetService("RunService"))
+local UIS          = Cloneref(game:GetService("UserInputService"))
+local TweenService = Cloneref(game:GetService("TweenService"))
+local LocalPlayer  = Players.LocalPlayer
+
+-- ============================================================
+--  CONFIG
+-- ============================================================
+local CFG = {
+    esp_enabled      = false,
+    esp_max_dist     = 1000,
+    aimbot_enabled   = false,
+    aimbot_fov       = 150,
+    aimbot_smooth    = 0.12,
+    aimbot_key       = Enum.KeyCode.Q,
+    aimbot_wallcheck = true,
+    aimbot_part      = "Head",
+    aimbot_enemy_only= true,
+    speed_enabled    = false,
+    speed_value      = 32,
+    jump_enabled     = false,
+    noclip_enabled   = false,
+    antifall_enabled = false,
+    tp_enabled       = false,
+    tp_target        = nil :: Player?,
+    tp_key           = Enum.KeyCode.T,
+    menu_key         = Enum.KeyCode.LeftShift,
+}
+
+-- ============================================================
+--  TEAM / ENEMY
+-- ============================================================
+local function is_enemy(p: Player): boolean
+    if not LocalPlayer.Team then return true end
+    return p.Team ~= LocalPlayer.Team
+end
+
+local function team_color(p: Player): Color3
+    if not is_enemy(p) then return Color3.fromRGB(50,200,255) end
+    local char = p.Character
+    if char and char:FindFirstChild("Zombie") then return Color3.fromRGB(100,255,50) end
+    return Color3.fromRGB(255,50,50)
+end
+
+-- ============================================================
+--  WALL CHECK
+-- ============================================================
+local function has_los(target: BasePart): boolean
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+    if not root then return false end
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = {char}
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local result = workspace:Raycast(root.Position, target.Position - root.Position, params)
+    if not result then return true end
+    return result.Instance:IsDescendantOf(target.Parent)
+end
+
+-- ============================================================
+--  TP BYPASS
+--  Micro-steps 8 studs + freeze hum pendant le tp
+--  Le serveur voit un déplacement physique progressif
+-- ============================================================
+local tp_busy = false
+
+local function safe_tp(dest: Vector3)
+    if tp_busy then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+
+    tp_busy = true
+
+    -- sauvegarde vitesse
+    local prev_ws = hum.WalkSpeed
+    local prev_jp = hum.JumpPower
+    hum.WalkSpeed = 0
+    hum.JumpPower = 0
+
+    -- désactive noclip temporairement pour pas conflicte
+    local prev_noclip = CFG.noclip_enabled
+    CFG.noclip_enabled = false
+
+    local start  = root.Position
+    local dist   = (dest - start).Magnitude
+    local steps  = math.max(1, math.ceil(dist / 8))
+
+    for i = 1, steps do
+        if not char or not char.Parent then break end
+        local t = i / steps
+        root.CFrame = CFrame.new(start:Lerp(dest, t))
+        -- wait proportionnel = vitesse perçue ≈ walkspeed normale
+        task.wait(0.06)
+    end
+
+    -- restore
+    hum.WalkSpeed      = prev_ws
+    hum.JumpPower      = prev_jp
+    CFG.noclip_enabled = prev_noclip
+    tp_busy = false
+end
+
+-- ============================================================
+--  ANTI FALL DAMAGE
+--  Avant l'impact : state Physics + zero vélocité Y
+-- ============================================================
+local fall_conn: RBXScriptConnection? = nil
+
+local function start_antifall()
+    if fall_conn then return end
+    fall_conn = RunService.Heartbeat:Connect(function()
+        if not CFG.antifall_enabled then return end
+        local char = LocalPlayer.Character
+        if not char then return end
+        local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum then return end
+        -- si on tombe vite → annule la vélocité verticale négative
+        if root.AssemblyLinearVelocity.Y < -40 then
+            root.AssemblyLinearVelocity = Vector3.new(
+                root.AssemblyLinearVelocity.X,
+                -10, -- cap la chute à -10 studs/s → no damage
+                root.AssemblyLinearVelocity.Z
+            )
+        end
+    end)
+end
+start_antifall()
+
+-- ============================================================
+--  GUI
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name           = "59zzrHub"
+gui.ResetOnSpawn   = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent         = gethui and gethui() or LocalPlayer:WaitForChild("PlayerGui")
+
+local function mk(class, props, parent)
+    local i = Instance.new(class)
+    for k,v in pairs(props) do i[k] = v end
+    i.Parent = parent
+    return i
+end
+
+local function tw(obj, props, t)
+    TweenService:Create(obj, TweenInfo.new(t or 0.2, Enum.EasingStyle.Quad), props):Play()
+end
+
+local Win = mk("Frame", {
+    Size             = UDim2.fromOffset(480, 530),
+    Position         = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint      = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = Color3.fromRGB(10,10,16),
+    BorderSizePixel  = 0,
+    Active           = true,
+    Draggable        = true,
+    Visible          = true,
+}, gui)
+mk("UICorner", { CornerRadius = UDim.new(0,12) }, Win)
+mk("UIStroke", { Color = Color3.fromRGB(200,30,30), Thickness = 2 }, Win)
+
+-- Header
+local Header = mk("Frame", {
+    Size             = UDim2.new(1,0,0,48),
+    BackgroundColor3 = Color3.fromRGB(20,5,5),
+    BorderSizePixel  = 0,
+}, Win)
+mk("UICorner", { CornerRadius = UDim.new(0,12) }, Header)
+mk("TextLabel", {
+    Size                   = UDim2.new(1,-60,1,0),
+    Position               = UDim2.fromOffset(16,0),
+    BackgroundTransparency = 1,
+    Text                   = "🧟  59zzr Hub  •  ZvH",
+    TextColor3             = Color3.fromRGB(255,70,70),
+    TextSize               = 16,
+    Font                   = Enum.Font.GothamBold,
+    TextXAlignment         = Enum.TextXAlignment.Left,
+}, Header)
+
+local CloseBtn = mk("TextButton", {
+    Size             = UDim2.fromOffset(32,32),
+    Position         = UDim2.new(1,-40,0,8),
+    BackgroundColor3 = Color3.fromRGB(180,30,30),
+    Text             = "✕",
+    TextColor3       = Color3.fromRGB(255,255,255),
+    TextSize         = 14,
+    Font             = Enum.Font.GothamBold,
+    BorderSizePixel  = 0,
+}, Header)
+mk("UICorner", { CornerRadius = UDim.new(0,6) }, CloseBtn)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    tw(Win, { Position = UDim2.fromScale(0.5, 1.6) }, 0.25)
+    task.wait(0.3)
+    Win.Visible = false
+end)
+
+mk("TextLabel", {
+    Size                   = UDim2.new(1,0,0,16),
+    Position               = UDim2.fromOffset(0,48),
+    BackgroundTransparency = 1,
+    Text                   = "[ LeftShift ] pour rouvrir",
+    TextColor3             = Color3.fromRGB(90,90,110),
+    TextSize               = 10,
+    Font                   = Enum.Font.Gotham,
+}, Win)
+
+-- Tabs bar
+local tab_bar = mk("Frame", {
+    Size             = UDim2.new(1,-16,0,32),
+    Position         = UDim2.fromOffset(8,68),
+    BackgroundColor3 = Color3.fromRGB(16,8,8),
+    BorderSizePixel  = 0,
+}, Win)
+mk("UICorner", { CornerRadius = UDim.new(0,8) }, tab_bar)
+mk("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding       = UDim.new(0,4),
+}, tab_bar)
+mk("UIPadding", { PaddingLeft=UDim.new(0,4), PaddingTop=UDim.new(0,4) }, tab_bar)
+
+local content = mk("Frame", {
+    Size                   = UDim2.new(1,-16,1,-112),
+    Position               = UDim2.fromOffset(8,104),
+    BackgroundTransparency = 1,
+    BorderSizePixel        = 0,
+}, Win)
+
+local tab_pages: {[string]: ScrollingFrame} = {}
+local tab_btns:  {[string]: TextButton}     = {}
+
+local function make_tab(name: string): ScrollingFrame
+    local btn = mk("TextButton", {
+        Size             = UDim2.new(0,88,1,-8),
+        BackgroundColor3 = Color3.fromRGB(22,10,10),
+        Text             = name,
+        TextColor3       = Color3.fromRGB(150,150,170),
+        TextSize         = 11,
+        Font             = Enum.Font.GothamBold,
+        BorderSizePixel  = 0,
+    }, tab_bar)
+    mk("UICorner", { CornerRadius = UDim.new(0,6) }, btn)
+
+    local page = mk("ScrollingFrame", {
+        Size                 = UDim2.new(1,0,1,0),
+        BackgroundTransparency = 1,
+        BorderSizePixel      = 0,
+        ScrollBarThickness   = 3,
+        ScrollBarImageColor3 = Color3.fromRGB(200,30,30),
+        Visible              = false,
+        CanvasSize           = UDim2.fromOffset(0,0),
+        AutomaticCanvasSize  = Enum.AutomaticSize.Y,
+    }, content)
+    mk("UIListLayout", { Padding=UDim.new(0,5), SortOrder=Enum.SortOrder.LayoutOrder }, page)
+    mk("UIPadding", { PaddingTop=UDim.new(0,5), PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4) }, page)
+
+    tab_pages[name] = page
+    tab_btns[name]  = btn
+
+    btn.MouseButton1Click:Connect(function()
+        for n,p in pairs(tab_pages) do
+            p.Visible = (n==name)
+            tab_btns[n].BackgroundColor3 = (n==name) and Color3.fromRGB(180,30,30) or Color3.fromRGB(22,10,10)
+            tab_btns[n].TextColor3 = (n==name) and Color3.fromRGB(255,255,255) or Color3.fromRGB(150,150,170)
+        end
+    end)
+    return page
+end
+
+local pg_combat = make_tab("⚔ Combat")
+local pg_move   = make_tab("🏃 Move")
+local pg_tp     = make_tab("📍 TP")
+local pg_params = make_tab("⚙ Params")
+
+-- active premier tab
+tab_pages["⚔ Combat"].Visible = true
+tab_btns["⚔ Combat"].BackgroundColor3 = Color3.fromRGB(180,30,30)
+tab_btns["⚔ Combat"].TextColor3 = Color3.fromRGB(255,255,255)
+
+-- ============================================================
+--  UI HELPERS
+-- ============================================================
+local function section(page, title: string)
+    mk("TextLabel", {
+        Size                   = UDim2.new(1,0,0,18),
+        BackgroundTransparency = 1,
+        Text                   = "── " .. title .. " ──",
+        TextColor3             = Color3.fromRGB(200,50,50),
+        TextSize               = 11,
+        Font                   = Enum.Font.GothamBold,
+    }, page)
+end
+
+local function toggle(page, label: string, default: boolean, cb: (boolean)->())
+    local active = default
+    local row = mk("Frame", {
+        Size             = UDim2.new(1,0,0,34),
+        BackgroundColor3 = Color3.fromRGB(17,9,9),
+        BorderSizePixel  = 0,
+    }, page)
+    mk("UICorner", { CornerRadius = UDim.new(0,7) }, row)
+    mk("TextLabel", {
+        Size                   = UDim2.new(1,-56,1,0),
+        Position               = UDim2.fromOffset(10,0),
+        BackgroundTransparency = 1,
+        Text                   = label,
+        TextColor3             = Color3.fromRGB(210,210,230),
+        TextSize               = 12,
+        Font                   = Enum.Font.Gotham,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+    }, row)
+    local pill = mk("TextButton", {
+        Size             = UDim2.fromOffset(44,22),
+        Position         = UDim2.new(1,-52,0.5,-11),
+        BackgroundColor3 = active and Color3.fromRGB(200,30,30) or Color3.fromRGB(45,45,55),
+        Text             = active and "ON" or "OFF",
+        TextColor3       = Color3.fromRGB(255,255,255),
+        TextSize         = 10,
+        Font             = Enum.Font.GothamBold,
+        BorderSizePixel  = 0,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(1,0) }, pill)
+    pill.MouseButton1Click:Connect(function()
+        active = not active
+        tw(pill, { BackgroundColor3 = active and Color3.fromRGB(200,30,30) or Color3.fromRGB(45,45,55) })
+        pill.Text = active and "ON" or "OFF"
+        cb(active)
+    end)
+    return row
+end
+
+local function slider(page, label: string, min_v: number, max_v: number, default: number, cb: (number)->())
+    local row = mk("Frame", {
+        Size             = UDim2.new(1,0,0,50),
+        BackgroundColor3 = Color3.fromRGB(17,9,9),
+        BorderSizePixel  = 0,
+    }, page)
+    mk("UICorner", { CornerRadius = UDim.new(0,7) }, row)
+    local val_lbl = mk("TextLabel", {
+        Size                   = UDim2.new(1,-16,0,20),
+        Position               = UDim2.fromOffset(10,4),
+        BackgroundTransparency = 1,
+        Text                   = label .. ": " .. default,
+        TextColor3             = Color3.fromRGB(210,210,230),
+        TextSize               = 11,
+        Font                   = Enum.Font.Gotham,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+    }, row)
+    local track = mk("Frame", {
+        Size             = UDim2.new(1,-20,0,6),
+        Position         = UDim2.fromOffset(10,30),
+        BackgroundColor3 = Color3.fromRGB(40,20,20),
+        BorderSizePixel  = 0,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(1,0) }, track)
+    local fill = mk("Frame", {
+        Size             = UDim2.new((default-min_v)/(max_v-min_v),0,1,0),
+        BackgroundColor3 = Color3.fromRGB(200,30,30),
+        BorderSizePixel  = 0,
+    }, track)
+    mk("UICorner", { CornerRadius = UDim.new(1,0) }, fill)
+    local drag = false
+    track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true end end)
+    UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+    UIS.InputChanged:Connect(function(i)
+        if not drag or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+        local rel = math.clamp((i.Position.X-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
+        local v   = math.floor(min_v+(max_v-min_v)*rel)
+        fill.Size = UDim2.new(rel,0,1,0)
+        val_lbl.Text = label .. ": " .. v
+        cb(v)
+    end)
+end
+
+local function keybind(page, label: string, default: Enum.KeyCode, cb: (Enum.KeyCode)->())
+    local row = mk("Frame", {
+        Size             = UDim2.new(1,0,0,34),
+        BackgroundColor3 = Color3.fromRGB(17,9,9),
+        BorderSizePixel  = 0,
+    }, page)
+    mk("UICorner", { CornerRadius = UDim.new(0,7) }, row)
+    mk("TextLabel", {
+        Size                   = UDim2.new(0.6,0,1,0),
+        Position               = UDim2.fromOffset(10,0),
+        BackgroundTransparency = 1,
+        Text                   = label,
+        TextColor3             = Color3.fromRGB(210,210,230),
+        TextSize               = 12,
+        Font                   = Enum.Font.Gotham,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+    }, row)
+    local listening = false
+    local btn = mk("TextButton", {
+        Size             = UDim2.fromOffset(80,22),
+        Position         = UDim2.new(1,-88,0.5,-11),
+        BackgroundColor3 = Color3.fromRGB(40,18,18),
+        Text             = default.Name,
+        TextColor3       = Color3.fromRGB(255,200,50),
+        TextSize         = 10,
+        Font             = Enum.Font.GothamBold,
+        BorderSizePixel  = 0,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(0,5) }, btn)
+    btn.MouseButton1Click:Connect(function()
+        listening=true; btn.Text="..."; btn.TextColor3=Color3.fromRGB(255,100,100)
+    end)
+    UIS.InputBegan:Connect(function(i,gpe)
+        if not listening or i.UserInputType~=Enum.UserInputType.Keyboard then return end
+        listening=false; btn.Text=i.KeyCode.Name; btn.TextColor3=Color3.fromRGB(255,200,50)
+        cb(i.KeyCode)
+    end)
+end
+
+-- ============================================================
+--  REMPLISSAGE TABS
+-- ============================================================
+
+-- ⚔ COMBAT
+section(pg_combat, "ESP")
+toggle(pg_combat, "👁  ESP Team Check", false, function(v) CFG.esp_enabled=v end)
+slider(pg_combat, "Distance max", 100, 2000, 1000, function(v) CFG.esp_max_dist=v end)
+
+section(pg_combat, "Aimbot")
+toggle(pg_combat, "🎯  Aimbot actif", false, function(v) CFG.aimbot_enabled=v end)
+toggle(pg_combat, "🧱  Wall Check", true, function(v) CFG.aimbot_wallcheck=v end)
+toggle(pg_combat, "👥  Ennemis seulement", true, function(v) CFG.aimbot_enemy_only=v end)
+toggle(pg_combat, "🎯  Viser la tête", true, function(v) CFG.aimbot_part=v and "Head" or "HumanoidRootPart" end)
+slider(pg_combat, "FOV", 30, 400, 150, function(v) CFG.aimbot_fov=v; fov_circle.Radius=v end)
+slider(pg_combat, "Smoothness (x100)", 1, 100, 12, function(v) CFG.aimbot_smooth=v/100 end)
+
+-- 🏃 MOVE
+section(pg_move, "Déplacement")
+toggle(pg_move, "⚡  Speed Hack", false, function(v) CFG.speed_enabled=v end)
+slider(pg_move, "Vitesse", 16, 200, 32, function(v) CFG.speed_value=v end)
+toggle(pg_move, "🕊  Infinite Jump", false, function(v) CFG.jump_enabled=v end)
+toggle(pg_move, "👻  Noclip", false, function(v) CFG.noclip_enabled=v end)
+
+section(pg_move, "Survie")
+toggle(pg_move, "🛡  Anti Fall Damage", false, function(v) CFG.antifall_enabled=v end)
+
+-- 📍 TP
+section(pg_tp, "Téléportation bypass")
+
+local tp_status = mk("TextLabel", {
+    Size                   = UDim2.new(1,0,0,22),
+    BackgroundTransparency = 1,
+    Text                   = "Cible : aucune  |  [T] pour tp",
+    TextColor3             = Color3.fromRGB(255,200,50),
+    TextSize               = 11,
+    Font                   = Enum.Font.GothamBold,
+    TextXAlignment         = Enum.TextXAlignment.Left,
+}, pg_tp)
+
+toggle(pg_tp, "📍  TP activé", false, function(v) CFG.tp_enabled=v end)
+
+local tp_list = mk("Frame", {
+    Size              = UDim2.new(1,0,0,0),
+    BackgroundTransparency = 1,
+    AutomaticSize     = Enum.AutomaticSize.Y,
+    BorderSizePixel   = 0,
+}, pg_tp)
+mk("UIListLayout", { Padding=UDim.new(0,4) }, tp_list)
+
+local function refresh_tp()
+    for _, c in ipairs(tp_list:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LocalPlayer then continue end
+        local btn = mk("TextButton", {
+            Size             = UDim2.new(1,0,0,28),
+            BackgroundColor3 = Color3.fromRGB(22,10,10),
+            Text             = p.DisplayName .. "  [" .. (p.Team and p.Team.Name or "?") .. "]",
+            TextColor3       = team_color(p),
+            TextSize         = 11,
+            Font             = Enum.Font.GothamBold,
+            BorderSizePixel  = 0,
+        }, tp_list)
+        mk("UICorner", { CornerRadius = UDim.new(0,6) }, btn)
+        btn.MouseButton1Click:Connect(function()
+            CFG.tp_target = p
+            tp_status.Text = "Cible : " .. p.DisplayName .. "  |  [T] pour tp"
+        end)
+    end
+end
+
+local ref_btn = mk("TextButton", {
+    Size             = UDim2.new(1,0,0,28),
+    BackgroundColor3 = Color3.fromRGB(50,18,18),
+    Text             = "🔄  Rafraîchir",
+    TextColor3       = Color3.fromRGB(255,255,255),
+    TextSize         = 11,
+    Font             = Enum.Font.GothamBold,
+    BorderSizePixel  = 0,
+}, pg_tp)
+mk("UICorner", { CornerRadius = UDim.new(0,6) }, ref_btn)
+ref_btn.MouseButton1Click:Connect(refresh_tp)
+refresh_tp()
+
+-- ⚙ PARAMS
+section(pg_params, "Touches")
+keybind(pg_params, "🎯  Touche Aimbot",    Enum.KeyCode.Q,          function(k) CFG.aimbot_key=k end)
+keybind(pg_params, "📍  Touche TP",         Enum.KeyCode.T,          function(k) CFG.tp_key=k end)
+keybind(pg_params, "🔲  Ouvrir Menu",       Enum.KeyCode.LeftShift,  function(k) CFG.menu_key=k end)
+
+-- ============================================================
+--  OPEN MENU
+-- ============================================================
+UIS.InputBegan:Connect(function(i,gpe)
+    if gpe then return end
+    if i.KeyCode == CFG.menu_key then
+        Win.Visible  = true
+        Win.Position = UDim2.fromScale(0.5, 1.6)
+        tw(Win, { Position = UDim2.fromScale(0.5, 0.5) }, 0.28)
+    end
+end)
+
+-- ============================================================
+--  DRAWINGS
+-- ============================================================
+local Camera = workspace.CurrentCamera
+
+local fov_circle = Drawing.new("Circle")
+fov_circle.Radius=CFG.aimbot_fov; fov_circle.Color=Color3.fromRGB(255,50,50)
+fov_circle.Thickness=1.5; fov_circle.Filled=false; fov_circle.Visible=false
+
+local target_dot = Drawing.new("Circle")
+target_dot.Radius=4; target_dot.Color=Color3.fromRGB(255,255,0)
+target_dot.Filled=true; target_dot.Visible=false
+
+-- ============================================================
+--  ESP LOOP
+-- ============================================================
+local esp_cache: {[Player]: {box:any,name:any,hp:any,team_lbl:any}} = {}
+
+local function esp_add(p: Player)
+    if esp_cache[p] then return end
+    local function sq(f,c) local d=Drawing.new("Square"); d.Thickness=1.5; d.Filled=f; d.Color=c; d.Visible=false; return d end
+    local function tx(s,c) local d=Drawing.new("Text"); d.Size=s; d.Center=true; d.Outline=true; d.Color=c; d.Visible=false; return d end
+    esp_cache[p]={box=sq(false,Color3.fromRGB(255,50,50)),name=tx(12,Color3.fromRGB(255,255,255)),hp=sq(true,Color3.fromRGB(60,255,60)),team_lbl=tx(10,Color3.fromRGB(255,255,255))}
+end
+local function esp_hide(p: Player)
+    if not esp_cache[p] then return end
+    for _,d in pairs(esp_cache[p]) do d.Visible=false end
+end
+local function esp_remove(p: Player)
+    if not esp_cache[p] then return end
+    for _,d in pairs(esp_cache[p]) do d:Remove() end
+    esp_cache[p]=nil
+end
+Players.PlayerRemoving:Connect(esp_remove)
+
+RunService.RenderStepped:Connect(function()
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p==LocalPlayer then continue end
+        local char=p.Character; if not char then esp_hide(p); continue end
+        local root=char:FindFirstChild("HumanoidRootPart") :: BasePart?
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum then esp_hide(p); continue end
+        if not CFG.esp_enabled then esp_hide(p); continue end
+        local dist=(root.Position-Camera.CFrame.Position).Magnitude
+        if dist>CFG.esp_max_dist then esp_hide(p); continue end
+        esp_add(p)
+        local ds=esp_cache[p]; local col=team_color(p)
+        local sp,vis=Camera:WorldToViewportPoint(root.Position)
+        if not vis then esp_hide(p); continue end
+        local scale=1600/dist; local bw,bh=scale*1.0,scale*1.8
+        ds.box.Color=col; ds.box.Size=Vector2.new(bw,bh); ds.box.Position=Vector2.new(sp.X-bw/2,sp.Y-bh/2); ds.box.Visible=true
+        ds.name.Text=p.DisplayName; ds.name.Position=Vector2.new(sp.X,sp.Y-bh/2-14); ds.name.Visible=true
+        ds.team_lbl.Text="[".. (p.Team and p.Team.Name or "?") .."] "..math.floor(dist).."m"; ds.team_lbl.Color=col; ds.team_lbl.Position=Vector2.new(sp.X,sp.Y+bh/2+2); ds.team_lbl.Visible=true
+        local ratio=math.clamp(hum.Health/math.max(hum.MaxHealth,1),0,1)
+        ds.hp.Color=Color3.fromRGB(math.floor((1-ratio)*255),math.floor(ratio*200),50); ds.hp.Size=Vector2.new(3,bh*ratio); ds.hp.Position=Vector2.new(sp.X-bw/2-7,sp.Y-bh/2+bh*(1-ratio)); ds.hp.Visible=true
+    end
+end)
+
+-- ============================================================
+--  AIMBOT LOOP
+-- ============================================================
+local function screen_center() local vp=Camera.ViewportSize; return Vector2.new(vp.X/2,vp.Y/2) end
+
+local function get_target()
+    local center=screen_center(); local best_p: Player?=nil; local best_sp: Vector2?=nil; local best_d=CFG.aimbot_fov
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p==LocalPlayer then continue end
+        if CFG.aimbot_enemy_only and not is_enemy(p) then continue end
+        local char=p.Character; if not char then continue end
+        local part=char:FindFirstChild(CFG.aimbot_part) :: BasePart?
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        if not part or not hum or hum.Health<=0 then continue end
+        if CFG.aimbot_wallcheck and not has_los(part) then continue end
+        local sp,vis=Camera:WorldToViewportPoint(part.Position)
+        if not vis then continue end
+        local sp2=Vector2.new(sp.X,sp.Y); local d=(sp2-center).Magnitude
+        if d<best_d then best_d=d; best_p=p; best_sp=sp2 end
+    end
+    return best_p,best_sp
+end
+
+local aim_held=false
+UIS.InputBegan:Connect(function(i,gpe) if not gpe and i.KeyCode==CFG.aimbot_key then aim_held=true end end)
+UIS.InputEnded:Connect(function(i) if i.KeyCode==CFG.aimbot_key then aim_held=false end end)
+
+RunService.RenderStepped:Connect(function()
+    local center=screen_center()
+    fov_circle.Visible=CFG.aimbot_enabled; fov_circle.Position=center
+    if not CFG.aimbot_enabled then target_dot.Visible=false; return end
+    local _,sp=get_target()
+    if sp then
+        if aim_held then
+            local cur=UIS:GetMouseLocation()
+            mousemoverel((sp-cur).X*CFG.aimbot_smooth,(sp-cur).Y*CFG.aimbot_smooth)
+        end
+        target_dot.Position=sp; target_dot.Visible=true
+    else target_dot.Visible=false end
+end)
+
+-- ============================================================
+--  SPEED
+-- ============================================================
+local cur_speed=16
+RunService.Heartbeat:Connect(function()
+    local char=LocalPlayer.Character; if not char then return end
+    local hum=char:FindFirstChildOfClass("Humanoid"); if not hum then return end
+    local target=CFG.speed_enabled and CFG.speed_value or 16
+    cur_speed=cur_speed+(target-cur_speed)*0.08
+    hum.WalkSpeed=cur_speed
+end)
+
+-- ============================================================
+--  INFINITE JUMP
+-- ============================================================
+UIS.JumpRequest:Connect(function()
+    if not CFG.jump_enabled then return end
+    local char=LocalPlayer.Character; if not char then return end
+    local hum=char:FindFirstChildOfClass("Humanoid")
+    if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+
+-- ============================================================
+--  NOCLIP
+-- ============================================================
+RunService.Stepped:Connect(function()
+    if not CFG.noclip_enabled then return end
+    local char=LocalPlayer.Character; if not char then return end
+    for _,p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide=false end
+    end
+end)
+
+-- ============================================================
+--  TP KEY
+-- ============================================================
+UIS.InputBegan:Connect(function(i,gpe)
+    if gpe or tp_busy then return end
+    if i.KeyCode~=CFG.tp_key or not CFG.tp_enabled then return end
+    if not CFG.tp_target then return end
+    local tc=CFG.tp_target.Character; if not tc then return end
+    local tr=tc:FindFirstChild("HumanoidRootPart") :: BasePart?; if not tr then return end
+    safe_tp(tr.Position + Vector3.new(0,3,3))
+end)
+
+print("[59zzr Hub v2] loaded | " .. game.PlaceId)
